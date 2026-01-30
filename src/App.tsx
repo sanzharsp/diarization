@@ -23,18 +23,19 @@ import {
 import type { TranscriptItem, Utterance, WordToken } from "./lib/types";
 import {
   buildSpeakerMap,
-  buildUtterancesByDiarSegments,
   createSpeakerId,
   extractDiarSegments,
   extractWords,
   formatTime,
   hashHue,
   mergeAdjacentSameSpeaker,
-  mergeUtterances
+  mergeUtterances,
+  smartJoinTokens
 } from "./lib/processing";
 import { diarizeAudio, transcribeAudio } from "./lib/api";
 import { saveDebugArtifacts } from "./lib/debug";
 import { encodeWav } from "./lib/wav";
+import { createAudioBufferFromMono, decodeAudioFile, getMonoSlice } from "./lib/audio";
 
 const NAV_ITEMS = [
   "Text to Speech",
@@ -51,10 +52,35 @@ const createId = () =>
     ? crypto.randomUUID()
     : `t_${Date.now()}_${Math.random().toString(16).slice(2)}`);
 
+const DIAR_SEGMENT_PADDING_SEC = 0.2;
+const ASR_CONCURRENCY = 3;
+
+const mapWithConcurrency = async <T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<R>
+) => {
+  const results: R[] = new Array(items.length);
+  let nextIndex = 0;
+  const workerCount = Math.max(1, Math.min(limit, items.length));
+  const workers = new Array(workerCount).fill(0).map(async () => {
+    while (true) {
+      const current = nextIndex;
+      if (current >= items.length) break;
+      nextIndex += 1;
+      results[current] = await fn(items[current], current);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+};
+
 type RecorderSession = {
   context: AudioContext;
   source: MediaStreamAudioSourceNode;
   processor: ScriptProcessorNode;
+  analyser: AnalyserNode;
+  analyserData: Uint8Array;
   gain: GainNode;
   stream: MediaStream;
   buffers: Float32Array[];
@@ -80,6 +106,8 @@ const App = () => {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const recorderRef = useRef<RecorderSession | null>(null);
   const recordTimerRef = useRef<number | null>(null);
+  const waveCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const waveAnimRef = useRef<number | null>(null);
 
   const activeTranscript = transcripts.find((t) => t.id === activeId) ?? transcripts[0];
 
@@ -129,7 +157,7 @@ const App = () => {
     setTranscripts((prev) => prev.map((t) => (t.id === id ? updater(t) : t)));
   };
 
-  const handleUpload = async (file: File) => {
+  const handleUpload = async (file: File, predecoded?: AudioBuffer) => {
     const id = createId();
     const title = file.name.replace(/\.[^/.]+$/, "");
     const createdAt = new Date().toISOString();
@@ -151,25 +179,79 @@ const App = () => {
     setActiveId(id);
 
     try {
-      const [asrResponse, diarResponse] = await Promise.all([
-        transcribeAudio(file),
-        diarizeAudio(file)
+      const [diarResponse, audioBuffer] = await Promise.all([
+        diarizeAudio(file),
+        predecoded ? Promise.resolve(predecoded) : decodeAudioFile(file)
       ]);
 
-      saveDebugArtifacts(title || id, asrResponse, diarResponse);
-
-      const asrPayload = asrResponse?.asr ?? asrResponse;
-      const words = extractWords(asrPayload);
       const diarSegments = mergeAdjacentSameSpeaker(extractDiarSegments(diarResponse));
-      const utterances = buildUtterancesByDiarSegments(words, diarSegments);
-      const speakers = Array.from(new Set(utterances.map((u) => u.speaker)));
+      const durationSec = audioBuffer.duration;
+
+      const asrSegmentResults = await mapWithConcurrency(
+        diarSegments,
+        ASR_CONCURRENCY,
+        async (seg, index) => {
+          const clipStart = Math.max(0, seg.start - DIAR_SEGMENT_PADDING_SEC);
+          const clipEnd = Math.min(durationSec, seg.end + DIAR_SEGMENT_PADDING_SEC);
+          if (clipEnd <= clipStart) {
+            return { seg, clipStart, clipEnd, asr: null };
+          }
+          const mono = getMonoSlice(audioBuffer, clipStart, clipEnd);
+          const wavBuffer = encodeWav(mono, audioBuffer.sampleRate);
+          const blob = new Blob([wavBuffer], { type: "audio/wav" });
+          const segFile = new File([blob], `seg_${index}_${seg.speaker}.wav`, {
+            type: "audio/wav"
+          });
+          const asr = await transcribeAudio(segFile);
+          return { seg, clipStart, clipEnd, asr };
+        }
+      );
+
+      const utterances: Utterance[] = [];
+      const words: WordToken[] = [];
+
+      for (const result of asrSegmentResults) {
+        if (!result.asr) continue;
+        const asrPayload = result.asr?.asr ?? result.asr;
+        const segmentWords = extractWords(asrPayload).map((w) => ({
+          ...w,
+          start: w.start + result.clipStart,
+          end: w.end + result.clipStart
+        }));
+
+        const filtered = segmentWords.filter((w) => {
+          const center = (w.start + w.end) / 2;
+          return center >= result.seg.start - 0.05 && center <= result.seg.end + 0.05;
+        });
+
+        if (filtered.length) {
+          words.push(...filtered);
+          utterances.push({
+            speaker: result.seg.speaker,
+            start: result.seg.start,
+            end: result.seg.end,
+            words: filtered,
+            text: smartJoinTokens(filtered.map((w) => w.word))
+          });
+        }
+      }
+
+      const mergedUtterances = mergeUtterances(utterances);
+      words.sort((a, b) => (a.start - b.start) || (a.end - b.end));
+      const speakers = Array.from(new Set(mergedUtterances.map((u) => u.speaker)));
+
+      saveDebugArtifacts(
+        title || id,
+        { diarSegments, asrSegments: asrSegmentResults },
+        diarResponse
+      );
 
       setTranscript(id, (prev) => ({
         ...prev,
         status: "ready",
         words,
         diarSegments,
-        utterances,
+        utterances: mergedUtterances,
         speakerMap: Object.keys(prev.speakerMap).length ? prev.speakerMap : buildSpeakerMap(speakers)
       }));
 
@@ -239,10 +321,85 @@ const App = () => {
   };
 
   const handleWaveSeek = (event: MouseEvent<HTMLDivElement>) => {
+    if (isRecording) return;
     if (!audioRef.current || !duration) return;
     const rect = event.currentTarget.getBoundingClientRect();
     const ratio = Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width));
     audioRef.current.currentTime = ratio * duration;
+  };
+
+  const prepareWaveCanvas = (canvas: HTMLCanvasElement) => {
+    const rect = canvas.getBoundingClientRect();
+    const width = Math.max(1, Math.floor(rect.width));
+    const height = Math.max(1, Math.floor(rect.height));
+    const dpr = window.devicePixelRatio || 1;
+    if (canvas.width !== Math.floor(width * dpr) || canvas.height !== Math.floor(height * dpr)) {
+      canvas.width = Math.floor(width * dpr);
+      canvas.height = Math.floor(height * dpr);
+    }
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return null;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    return { ctx, width, height };
+  };
+
+  const startWaveAnimation = (session: RecorderSession) => {
+    const canvas = waveCanvasRef.current;
+    if (!canvas) return;
+
+    const draw = () => {
+      const prepared = prepareWaveCanvas(canvas);
+      if (!prepared) return;
+      const { ctx, width, height } = prepared;
+      ctx.clearRect(0, 0, width, height);
+
+      session.analyser.getByteTimeDomainData(session.analyserData);
+      const bars = 48;
+      const step = Math.floor(session.analyserData.length / bars);
+      const center = height / 2;
+      const barWidth = width / (bars * 1.2);
+      const gap = barWidth * 0.4;
+
+      const gradient = ctx.createLinearGradient(0, 0, width, 0);
+      gradient.addColorStop(0, "rgba(31, 122, 97, 0.6)");
+      gradient.addColorStop(0.5, "rgba(17, 24, 39, 0.9)");
+      gradient.addColorStop(1, "rgba(31, 122, 97, 0.6)");
+
+      ctx.strokeStyle = gradient;
+      ctx.lineWidth = Math.max(2, barWidth);
+      ctx.lineCap = "round";
+
+      let x = (width - bars * (barWidth + gap) + gap) / 2;
+      for (let i = 0; i < bars; i += 1) {
+        const sample = session.analyserData[i * step] / 128 - 1;
+        const amp = Math.min(1, Math.abs(sample) * 1.5 + 0.05);
+        const barHeight = Math.max(6, amp * height * 0.9);
+        ctx.beginPath();
+        ctx.moveTo(x, center - barHeight / 2);
+        ctx.lineTo(x, center + barHeight / 2);
+        ctx.stroke();
+        x += barWidth + gap;
+      }
+
+      waveAnimRef.current = requestAnimationFrame(draw);
+    };
+
+    if (waveAnimRef.current) {
+      cancelAnimationFrame(waveAnimRef.current);
+    }
+    draw();
+  };
+
+  const stopWaveAnimation = () => {
+    if (waveAnimRef.current) {
+      cancelAnimationFrame(waveAnimRef.current);
+      waveAnimRef.current = null;
+    }
+    const canvas = waveCanvasRef.current;
+    if (!canvas) return;
+    const prepared = prepareWaveCanvas(canvas);
+    if (!prepared) return;
+    prepared.ctx.clearRect(0, 0, prepared.width, prepared.height);
   };
 
   const startRecording = async () => {
@@ -268,8 +425,13 @@ const App = () => {
       }
 
       const context = new AudioContext({ sampleRate: 48000 });
+      await context.resume();
       const source = context.createMediaStreamSource(stream);
       const processor = context.createScriptProcessor(4096, 1, 1);
+      const analyser = context.createAnalyser();
+      analyser.fftSize = 1024;
+      analyser.smoothingTimeConstant = 0.85;
+      const analyserData = new Uint8Array(analyser.frequencyBinCount);
       const gain = context.createGain();
       gain.gain.value = 0;
 
@@ -277,6 +439,8 @@ const App = () => {
         context,
         source,
         processor,
+        analyser,
+        analyserData,
         gain,
         stream,
         buffers: [],
@@ -302,6 +466,7 @@ const App = () => {
         }
       };
 
+      source.connect(analyser);
       source.connect(processor);
       processor.connect(gain);
       gain.connect(context.destination);
@@ -312,6 +477,7 @@ const App = () => {
       recordTimerRef.current = window.setInterval(() => {
         setRecordingTime((t) => t + 1);
       }, 1000);
+      startWaveAnimation(session);
     } catch (err: any) {
       message.error(err?.message || "Microphone access denied.");
     }
@@ -323,6 +489,7 @@ const App = () => {
 
     session.processor.disconnect();
     session.source.disconnect();
+    session.analyser.disconnect();
     session.gain.disconnect();
     session.stream.getTracks().forEach((track) => track.stop());
     session.processor.onaudioprocess = null;
@@ -336,6 +503,7 @@ const App = () => {
     await session.context.close();
     setIsRecording(false);
     setMicLevel(0);
+    stopWaveAnimation();
 
     if (!session.bufferLength) {
       message.warning("No audio captured.");
@@ -353,7 +521,8 @@ const App = () => {
     const blob = new Blob([wavBuffer], { type: "audio/wav" });
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");
     const file = new File([blob], `recording_${stamp}.wav`, { type: "audio/wav" });
-    void handleUpload(file);
+    const audioBuffer = await createAudioBufferFromMono(pcm, session.sampleRate);
+    void handleUpload(file, audioBuffer);
   };
 
   const toggleRecording = () => {
@@ -444,7 +613,8 @@ const App = () => {
               icon={isPlaying ? <PauseCircleFilled /> : <PlayCircleFilled />}
               onClick={handleTogglePlay}
             />
-            <div className="waveform" onClick={handleWaveSeek}>
+            <div className={isRecording ? "waveform recording" : "waveform"} onClick={handleWaveSeek}>
+              <canvas ref={waveCanvasRef} className="waveform-canvas" />
               <div className="waveform-bars" />
               <div className="waveform-progress" style={{ width: `${progress * 100}%` }} />
             </div>
