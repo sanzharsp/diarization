@@ -448,6 +448,17 @@ body {
   flex-wrap: wrap;
 }
 
+.toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.diar-select {
+  min-width: 140px;
+}
+
 .speaker-stack {
   display: flex;
   gap: 8px;

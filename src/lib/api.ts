@@ -17,17 +17,42 @@ const buildHeaders = () => {
   return headers;
 };
 
-const DIAR_PARAMS: Record<string, string> = {
-  return_rttm: "false",
-  exclusive: "true",
-  // В конфиге pyannote 3.1 для segmentation-3.0 обычно тюнят min_duration_off,
-  // а "seg_threshold" может вообще не быть параметром пайплайна (зависит от реализации бэка).
-  seg_min_duration_off: "0.0",
-  cluster_threshold: "0.6",
-  min_cluster_size: "12",
-  embed_exclude_overlap: "true",
-  seg_threshold: "0.5"
+export type DiarParams = Record<string, string>;
+
+export const DIAR_PRESETS: Record<"sensitive" | "balanced" | "strict", DiarParams> = {
+  sensitive: {
+    return_rttm: "false",
+    exclusive: "true",
+    embed_exclude_overlap: "true",
+    seg_min_duration_off: "0.0",
+    seg_threshold: "0.40",
+    cluster_threshold: "0.58",
+    vbx_fa: "0.07",
+    vbx_fb: "0.70"
+  },
+  balanced: {
+    return_rttm: "false",
+    exclusive: "true",
+    embed_exclude_overlap: "true",
+    seg_min_duration_off: "0.0",
+    seg_threshold: "0.50",
+    cluster_threshold: "0.60",
+    vbx_fa: "0.07",
+    vbx_fb: "0.80"
+  },
+  strict: {
+    return_rttm: "false",
+    exclusive: "true",
+    embed_exclude_overlap: "true",
+    seg_min_duration_off: "0.12",
+    seg_threshold: "0.60",
+    cluster_threshold: "0.62",
+    vbx_fa: "0.07",
+    vbx_fb: "1.00"
+  }
 };
+
+export const DIAR_PARAMS: DiarParams = DIAR_PRESETS.balanced;
 
 const scheduleStt = async <T>(fn: () => Promise<T>) => {
   let release: (() => void) | null = null;
@@ -73,11 +98,11 @@ export const transcribeAudio = async (file: File) => {
   });
 };
 
-export const diarizeAudio = async (file: File) => {
+export const diarizeAudio = async (file: File, params: DiarParams = DIAR_PARAMS) => {
   const form = new FormData();
   form.append("audio", file);
 
-  const query = new URLSearchParams(DIAR_PARAMS).toString();
+  const query = new URLSearchParams(params).toString();
   const res = await fetch(`${API_BASE}/diarization/analyze?${query}`, {
     method: "POST",
     headers: buildHeaders(),

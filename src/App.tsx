@@ -32,7 +32,8 @@ import {
   mergeAdjacentSameSpeaker,
   mergeUtterances
 } from "./lib/processing";
-import { diarizeAudio, transcribeAudio } from "./lib/api";
+import { DIAR_PRESETS, diarizeAudio, transcribeAudio } from "./lib/api";
+import type { DiarParams } from "./lib/api";
 import { saveDebugArtifacts } from "./lib/debug";
 import { encodeWav } from "./lib/wav";
 import { createAudioBufferFromMono, decodeAudioFile, getMonoSlice } from "./lib/audio";
@@ -105,6 +106,7 @@ const App = () => {
   const [recordingTime, setRecordingTime] = useState(0);
   const [micLevel, setMicLevel] = useState(0);
   const [playbackLevel, setPlaybackLevel] = useState(0);
+  const [diarPreset, setDiarPreset] = useState<keyof typeof DIAR_PRESETS>("balanced");
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const recorderRef = useRef<RecorderSession | null>(null);
   const recordTimerRef = useRef<number | null>(null);
@@ -190,8 +192,9 @@ const App = () => {
     setActiveId(id);
 
     try {
+      const diarParams: DiarParams = DIAR_PRESETS[diarPreset];
       const [diarResponse, audioBuffer] = await Promise.all([
-        diarizeAudio(file),
+        diarizeAudio(file, diarParams),
         predecoded ? Promise.resolve(predecoded) : decodeAudioFile(file)
       ]);
 
@@ -727,8 +730,8 @@ const App = () => {
         </div>
 
           <div className="transcript-card">
-            <div className="transcript-toolbar">
-              <div className="speaker-stack">
+          <div className="transcript-toolbar">
+            <div className="speaker-stack">
                 {speakerIds.map((speakerId) => {
                   const isSpeaking = speakerId === activeSpeakerId && voiceLevel > 0.02;
                   const hue = hashHue(speakerId);
@@ -758,7 +761,19 @@ const App = () => {
                     </button>
                   );
                 })}
-              </div>
+            </div>
+            <div className="toolbar-actions">
+              <Select
+                size="small"
+                className="diar-select"
+                value={diarPreset}
+                onChange={(value) => setDiarPreset(value as keyof typeof DIAR_PRESETS)}
+                options={[
+                  { value: "sensitive", label: "Sensitive" },
+                  { value: "balanced", label: "Balanced" },
+                  { value: "strict", label: "Strict" }
+                ]}
+              />
               <Button
                 icon={<PlusOutlined />}
                 className="ghost-btn"
@@ -767,6 +782,7 @@ const App = () => {
                 Add speaker
               </Button>
             </div>
+          </div>
 
             {!activeTranscript && (
               <Empty

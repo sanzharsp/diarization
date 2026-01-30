@@ -3,7 +3,7 @@ import type { DiarSegment, Utterance, WordToken } from "./types";
 const WORD_CENTER_EPS = 0.05;
 const MERGE_DIAR_GAP_SEC = 0.2;
 // Increase to merge small pauses without over-merging long silences.
-const MERGE_UTTERANCE_GAP_SEC = 1.0;
+const MERGE_UTTERANCE_GAP_SEC = 2.0;
 
 export const formatTime = (seconds: number) => {
   if (!Number.isFinite(seconds) || seconds < 0) return "00:00";
