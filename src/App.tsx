@@ -11,9 +11,10 @@ import {
   Upload,
   message
 } from "antd";
-import type { RcFile } from "antd/es/upload";
 import {
   EditOutlined,
+  AudioOutlined,
+  StopOutlined,
   PauseCircleFilled,
   PlayCircleFilled,
   PlusOutlined,
@@ -33,6 +34,7 @@ import {
 } from "./lib/processing";
 import { diarizeAudio, transcribeAudio } from "./lib/api";
 import { saveDebugArtifacts } from "./lib/debug";
+import { encodeWav } from "./lib/wav";
 
 const NAV_ITEMS = [
   "Text to Speech",
@@ -49,6 +51,18 @@ const createId = () =>
     ? crypto.randomUUID()
     : `t_${Date.now()}_${Math.random().toString(16).slice(2)}`);
 
+type RecorderSession = {
+  context: AudioContext;
+  source: MediaStreamAudioSourceNode;
+  processor: ScriptProcessorNode;
+  gain: GainNode;
+  stream: MediaStream;
+  buffers: Float32Array[];
+  bufferLength: number;
+  sampleRate: number;
+  lastLevelAt: number;
+};
+
 const App = () => {
   const [transcripts, setTranscripts] = useState<TranscriptItem[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
@@ -60,7 +74,12 @@ const App = () => {
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
+  const [isRecording, setIsRecording] = useState(false);
+  const [recordingTime, setRecordingTime] = useState(0);
+  const [micLevel, setMicLevel] = useState(0);
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const recorderRef = useRef<RecorderSession | null>(null);
+  const recordTimerRef = useRef<number | null>(null);
 
   const activeTranscript = transcripts.find((t) => t.id === activeId) ?? transcripts[0];
 
@@ -110,7 +129,7 @@ const App = () => {
     setTranscripts((prev) => prev.map((t) => (t.id === id ? updater(t) : t)));
   };
 
-  const handleUpload = async (file: RcFile) => {
+  const handleUpload = async (file: File) => {
     const id = createId();
     const title = file.name.replace(/\.[^/.]+$/, "");
     const createdAt = new Date().toISOString();
@@ -226,6 +245,125 @@ const App = () => {
     audioRef.current.currentTime = ratio * duration;
   };
 
+  const startRecording = async () => {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      message.error("Microphone not supported in this browser.");
+      return;
+    }
+    if (isRecording) return;
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: 1,
+          sampleRate: 48000,
+          sampleSize: 16,
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false
+        }
+      });
+
+      if (audioRef.current && !audioRef.current.paused) {
+        audioRef.current.pause();
+      }
+
+      const context = new AudioContext({ sampleRate: 48000 });
+      const source = context.createMediaStreamSource(stream);
+      const processor = context.createScriptProcessor(4096, 1, 1);
+      const gain = context.createGain();
+      gain.gain.value = 0;
+
+      const session: RecorderSession = {
+        context,
+        source,
+        processor,
+        gain,
+        stream,
+        buffers: [],
+        bufferLength: 0,
+        sampleRate: context.sampleRate,
+        lastLevelAt: 0
+      };
+
+      processor.onaudioprocess = (event) => {
+        const input = event.inputBuffer.getChannelData(0);
+        session.buffers.push(new Float32Array(input));
+        session.bufferLength += input.length;
+
+        const now = performance.now();
+        if (now - session.lastLevelAt > 60) {
+          let sum = 0;
+          for (let i = 0; i < input.length; i += 1) {
+            sum += input[i] * input[i];
+          }
+          const rms = Math.sqrt(sum / input.length);
+          setMicLevel(Math.min(1, rms * 2.4));
+          session.lastLevelAt = now;
+        }
+      };
+
+      source.connect(processor);
+      processor.connect(gain);
+      gain.connect(context.destination);
+
+      recorderRef.current = session;
+      setRecordingTime(0);
+      setIsRecording(true);
+      recordTimerRef.current = window.setInterval(() => {
+        setRecordingTime((t) => t + 1);
+      }, 1000);
+    } catch (err: any) {
+      message.error(err?.message || "Microphone access denied.");
+    }
+  };
+
+  const stopRecording = async () => {
+    const session = recorderRef.current;
+    if (!session) return;
+
+    session.processor.disconnect();
+    session.source.disconnect();
+    session.gain.disconnect();
+    session.stream.getTracks().forEach((track) => track.stop());
+    session.processor.onaudioprocess = null;
+    recorderRef.current = null;
+
+    if (recordTimerRef.current) {
+      window.clearInterval(recordTimerRef.current);
+      recordTimerRef.current = null;
+    }
+
+    await session.context.close();
+    setIsRecording(false);
+    setMicLevel(0);
+
+    if (!session.bufferLength) {
+      message.warning("No audio captured.");
+      return;
+    }
+
+    const pcm = new Float32Array(session.bufferLength);
+    let offset = 0;
+    for (const chunk of session.buffers) {
+      pcm.set(chunk, offset);
+      offset += chunk.length;
+    }
+
+    const wavBuffer = encodeWav(pcm, session.sampleRate);
+    const blob = new Blob([wavBuffer], { type: "audio/wav" });
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const file = new File([blob], `recording_${stamp}.wav`, { type: "audio/wav" });
+    void handleUpload(file);
+  };
+
+  const toggleRecording = () => {
+    if (isRecording) {
+      void stopRecording();
+    } else {
+      void startRecording();
+    }
+  };
+
   const progress = duration ? Math.min(1, currentTime / duration) : 0;
 
   return (
@@ -299,24 +437,47 @@ const App = () => {
 
         <section className="workspace">
           <div className="player-card">
-            <div className="player-left">
-              <Button
-                type="text"
-                className="play-btn"
-                icon={isPlaying ? <PauseCircleFilled /> : <PlayCircleFilled />}
-                onClick={handleTogglePlay}
-              />
-              <div className="waveform" onClick={handleWaveSeek}>
-                <div className="waveform-bars" />
-                <div className="waveform-progress" style={{ width: `${progress * 100}%` }} />
-              </div>
+          <div className="player-left">
+            <Button
+              type="text"
+              className="play-btn"
+              icon={isPlaying ? <PauseCircleFilled /> : <PlayCircleFilled />}
+              onClick={handleTogglePlay}
+            />
+            <div className="waveform" onClick={handleWaveSeek}>
+              <div className="waveform-bars" />
+              <div className="waveform-progress" style={{ width: `${progress * 100}%` }} />
             </div>
+          </div>
+          <div className="player-right">
             <div className="player-meta">
               <span>{formatTime(currentTime)}</span>
               <span className="divider" />
               <span>{formatTime(duration)}</span>
             </div>
+            <div className="record-control">
+              <button
+                type="button"
+                className={isRecording ? "record-btn recording" : "record-btn"}
+                onClick={toggleRecording}
+              >
+                <span
+                  className="record-level"
+                  style={{ transform: `scale(${1 + micLevel * 1.4})` }}
+                />
+                <span className="record-icon">
+                  {isRecording ? <StopOutlined /> : <AudioOutlined />}
+                </span>
+              </button>
+              <div className="record-meta">
+                <span className="record-label">
+                  {isRecording ? "Recording" : "Mic test"}
+                </span>
+                <span className="record-time">{formatTime(recordingTime)}</span>
+              </div>
+            </div>
           </div>
+        </div>
 
           <div className="transcript-card">
             <div className="transcript-toolbar">

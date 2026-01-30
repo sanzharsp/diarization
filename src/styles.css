@@ -234,6 +234,84 @@ body {
   border-radius: 50%;
 }
 
+.player-right {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+}
+
+.record-control {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.record-btn {
+  position: relative;
+  width: 56px;
+  height: 56px;
+  border-radius: 50%;
+  border: none;
+  background: #121212;
+  color: #ffffff;
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+  transition: transform 0.2s ease;
+}
+
+.record-btn:hover {
+  transform: translateY(-1px);
+}
+
+.record-btn::after {
+  content: "";
+  position: absolute;
+  inset: -6px;
+  border-radius: 50%;
+  border: 1px solid rgba(239, 68, 68, 0.4);
+  opacity: 0;
+}
+
+.record-btn.recording::after {
+  opacity: 1;
+  animation: recordPulse 1.4s ease-out infinite;
+}
+
+.record-level {
+  position: absolute;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #ef4444;
+  opacity: 0.85;
+  z-index: 0;
+  transition: transform 0.08s linear;
+}
+
+.record-icon {
+  font-size: 18px;
+  z-index: 1;
+}
+
+.record-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.record-label {
+  font-weight: 600;
+  font-size: 12px;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.record-time {
+  font-size: 12px;
+  color: var(--muted);
+}
+
 .transcript-card {
   background: var(--panel);
   border-radius: 28px;
@@ -386,6 +464,21 @@ body {
   }
 }
 
+@keyframes recordPulse {
+  0% {
+    transform: scale(0.8);
+    opacity: 0.4;
+  }
+  60% {
+    transform: scale(1.15);
+    opacity: 0.1;
+  }
+  100% {
+    transform: scale(1.3);
+    opacity: 0;
+  }
+}
+
 @media (max-width: 1024px) {
   .main-grid {
     grid-template-columns: 1fr;
@@ -412,5 +505,10 @@ body {
 
   .player-meta {
     align-self: flex-end;
+  }
+
+  .player-right {
+    width: 100%;
+    justify-content: space-between;
   }
 }
