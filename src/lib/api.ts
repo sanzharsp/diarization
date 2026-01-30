@@ -23,9 +23,10 @@ const DIAR_PARAMS: Record<string, string> = {
   // В конфиге pyannote 3.1 для segmentation-3.0 обычно тюнят min_duration_off,
   // а "seg_threshold" может вообще не быть параметром пайплайна (зависит от реализации бэка).
   seg_min_duration_off: "0.0",
-  cluster_threshold: "0.7045654963945799",
+  cluster_threshold: "0.6",
   min_cluster_size: "12",
-  embed_exclude_overlap: "true"
+  embed_exclude_overlap: "true",
+  seg_threshold: "0.5"
 };
 
 const scheduleStt = async <T>(fn: () => Promise<T>) => {

@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState, type CSSProperties, type MouseEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent } from "react";
 import {
   Button,
   Empty,
@@ -104,11 +104,16 @@ const App = () => {
   const [isRecording, setIsRecording] = useState(false);
   const [recordingTime, setRecordingTime] = useState(0);
   const [micLevel, setMicLevel] = useState(0);
+  const [playbackLevel, setPlaybackLevel] = useState(0);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const recorderRef = useRef<RecorderSession | null>(null);
   const recordTimerRef = useRef<number | null>(null);
   const waveCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const waveAnimRef = useRef<number | null>(null);
+  const playbackRafRef = useRef<number | null>(null);
+  const playbackContextRef = useRef<AudioContext | null>(null);
+  const playbackAnalyserRef = useRef<AnalyserNode | null>(null);
+  const playbackDataRef = useRef<Uint8Array | null>(null);
 
   const activeTranscript = transcripts.find((t) => t.id === activeId) ?? transcripts[0];
 
@@ -153,6 +158,11 @@ const App = () => {
     );
     return idx >= 0 ? idx : null;
   }, [activeTranscript, currentTime]);
+
+  const activeSpeakerId = useMemo(() => {
+    if (!activeTranscript || activeUtteranceIndex == null) return null;
+    return activeTranscript.utterances[activeUtteranceIndex]?.speaker ?? null;
+  }, [activeTranscript, activeUtteranceIndex]);
 
   const setTranscript = (id: string, updater: (prev: TranscriptItem) => TranscriptItem) => {
     setTranscripts((prev) => prev.map((t) => (t.id === id ? updater(t) : t)));
@@ -396,6 +406,69 @@ const App = () => {
     prepared.ctx.clearRect(0, 0, prepared.width, prepared.height);
   };
 
+  const startPlaybackMeter = () => {
+    const audio = audioRef.current;
+    if (!audio) return;
+
+    if (!playbackContextRef.current) {
+      const context = new AudioContext();
+      const source = context.createMediaElementSource(audio);
+      const analyser = context.createAnalyser();
+      analyser.fftSize = 1024;
+      analyser.smoothingTimeConstant = 0.78;
+      source.connect(analyser);
+      analyser.connect(context.destination);
+      playbackContextRef.current = context;
+      playbackAnalyserRef.current = analyser;
+      playbackDataRef.current = new Uint8Array(analyser.frequencyBinCount);
+    }
+
+    const context = playbackContextRef.current;
+    if (context && context.state === "suspended") {
+      void context.resume();
+    }
+
+    const analyser = playbackAnalyserRef.current;
+    const data = playbackDataRef.current;
+    if (!analyser || !data) return;
+
+    const tick = () => {
+      analyser.getByteTimeDomainData(data);
+      let sum = 0;
+      for (let i = 0; i < data.length; i += 1) {
+        const sample = (data[i] - 128) / 128;
+        sum += sample * sample;
+      }
+      const rms = Math.sqrt(sum / data.length);
+      setPlaybackLevel(Math.min(1, rms * 3.2));
+      playbackRafRef.current = requestAnimationFrame(tick);
+    };
+
+    if (playbackRafRef.current == null) {
+      tick();
+    }
+  };
+
+  const stopPlaybackMeter = () => {
+    if (playbackRafRef.current) {
+      cancelAnimationFrame(playbackRafRef.current);
+      playbackRafRef.current = null;
+    }
+    setPlaybackLevel(0);
+  };
+
+  useEffect(() => {
+    return () => {
+      stopPlaybackMeter();
+      if (playbackContextRef.current) {
+        void playbackContextRef.current.close();
+        playbackContextRef.current = null;
+      }
+      playbackAnalyserRef.current = null;
+      playbackDataRef.current = null;
+    };
+  }, []);
+
   const startRecording = async () => {
     if (!navigator.mediaDevices?.getUserMedia) {
       message.error("Microphone not supported in this browser.");
@@ -528,10 +601,14 @@ const App = () => {
   };
 
   const progress = duration ? Math.min(1, currentTime / duration) : 0;
-  const playerStyle = { "--mic": isRecording ? micLevel : 0 } as CSSProperties;
+  const voiceLevel = isRecording ? micLevel : isPlaying ? playbackLevel : 0;
+  const appStyle = {
+    "--mic": isRecording ? micLevel : 0,
+    "--voice": voiceLevel
+  } as CSSProperties;
 
   return (
-    <div className="app-shell">
+    <div className="app-shell" style={appStyle}>
       <header className="top-nav">
         {NAV_ITEMS.map((item) => (
           <button
@@ -600,10 +677,7 @@ const App = () => {
         </aside>
 
         <section className="workspace">
-          <div
-            className={isRecording ? "player-card recording" : "player-card"}
-            style={playerStyle}
-          >
+          <div className={isRecording ? "player-card recording" : "player-card"}>
           <div className="player-left">
             <Button
               type="text"
@@ -656,12 +730,13 @@ const App = () => {
             <div className="transcript-toolbar">
               <div className="speaker-stack">
                 {speakerIds.map((speakerId) => {
+                  const isSpeaking = speakerId === activeSpeakerId && voiceLevel > 0.02;
                   const hue = hashHue(speakerId);
                   return (
                     <button
                       key={speakerId}
                       type="button"
-                      className="speaker-chip"
+                      className={isSpeaking ? "speaker-chip speaking" : "speaker-chip"}
                       onClick={() =>
                         setRenameState({
                           open: true,
@@ -716,6 +791,7 @@ const App = () => {
                 {activeTranscript.utterances.map((utterance, index) => {
                   const hue = hashHue(utterance.speaker);
                   const isActive = activeUtteranceIndex === index;
+                  const isSpeaking = isActive && voiceLevel > 0.02;
                   return (
                     <div
                       key={`${utterance.start}-${utterance.end}-${index}`}
@@ -730,7 +806,7 @@ const App = () => {
                     >
                       <div className="utterance-meta">
                         <span
-                          className="speaker-avatar"
+                          className={isSpeaking ? "speaker-avatar speaking" : "speaker-avatar"}
                           style={{
                             background: `conic-gradient(from 180deg, hsl(${hue} 72% 64%), hsl(${(hue + 60) % 360} 78% 62%), hsl(${(hue + 120) % 360} 72% 58%))`
                           }}
@@ -787,9 +863,18 @@ const App = () => {
         src={activeTranscript?.audioUrl}
         onTimeUpdate={() => setCurrentTime(audioRef.current?.currentTime ?? 0)}
         onLoadedMetadata={() => setDuration(audioRef.current?.duration ?? 0)}
-        onPlay={() => setIsPlaying(true)}
-        onPause={() => setIsPlaying(false)}
-        onEnded={() => setIsPlaying(false)}
+        onPlay={() => {
+          setIsPlaying(true);
+          startPlaybackMeter();
+        }}
+        onPause={() => {
+          setIsPlaying(false);
+          stopPlaybackMeter();
+        }}
+        onEnded={() => {
+          setIsPlaying(false);
+          stopPlaybackMeter();
+        }}
       />
 
       <Modal
