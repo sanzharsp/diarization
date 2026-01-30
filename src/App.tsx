@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState, type MouseEvent } from "react";
+import { useMemo, useRef, useState, type CSSProperties, type MouseEvent } from "react";
 import {
   Button,
   Empty,
@@ -23,14 +23,14 @@ import {
 import type { TranscriptItem, Utterance, WordToken } from "./lib/types";
 import {
   buildSpeakerMap,
+  buildUtterancesByDiarSegments,
   createSpeakerId,
   extractDiarSegments,
   extractWords,
   formatTime,
   hashHue,
   mergeAdjacentSameSpeaker,
-  mergeUtterances,
-  smartJoinTokens
+  mergeUtterances
 } from "./lib/processing";
 import { diarizeAudio, transcribeAudio } from "./lib/api";
 import { saveDebugArtifacts } from "./lib/debug";
@@ -46,13 +46,14 @@ const NAV_ITEMS = [
   "Voice Cloning",
   "ElevenReader"
 ];
+const MIC_BARS = Array.from({ length: 7 }, (_, i) => i);
 
 const createId = () =>
   (typeof crypto !== "undefined" && "randomUUID" in crypto
     ? crypto.randomUUID()
     : `t_${Date.now()}_${Math.random().toString(16).slice(2)}`);
 
-const DIAR_SEGMENT_PADDING_SEC = 0.2;
+const ASR_SEGMENT_PADDING_SEC = 0.2;
 const ASR_CONCURRENCY = 3;
 
 const mapWithConcurrency = async <T, R>(
@@ -185,29 +186,29 @@ const App = () => {
       ]);
 
       const diarSegments = mergeAdjacentSameSpeaker(extractDiarSegments(diarResponse));
+      const diarSegmentsForAttribution = diarSegments;
+      const asrSegments = diarSegmentsForAttribution;
       const durationSec = audioBuffer.duration;
 
       const asrSegmentResults = await mapWithConcurrency(
-        diarSegments,
+        asrSegments,
         ASR_CONCURRENCY,
         async (seg, index) => {
-          const clipStart = Math.max(0, seg.start - DIAR_SEGMENT_PADDING_SEC);
-          const clipEnd = Math.min(durationSec, seg.end + DIAR_SEGMENT_PADDING_SEC);
+          const clipStart = Math.max(0, seg.start - ASR_SEGMENT_PADDING_SEC);
+          const clipEnd = Math.min(durationSec, seg.end + ASR_SEGMENT_PADDING_SEC);
           if (clipEnd <= clipStart) {
             return { seg, clipStart, clipEnd, asr: null };
           }
           const mono = getMonoSlice(audioBuffer, clipStart, clipEnd);
           const wavBuffer = encodeWav(mono, audioBuffer.sampleRate);
           const blob = new Blob([wavBuffer], { type: "audio/wav" });
-          const segFile = new File([blob], `seg_${index}_${seg.speaker}.wav`, {
-            type: "audio/wav"
-          });
+          const speakerTag = "speaker" in seg ? `_${seg.speaker}` : "";
+          const segFile = new File([blob], `seg_${index}${speakerTag}.wav`, { type: "audio/wav" });
           const asr = await transcribeAudio(segFile);
           return { seg, clipStart, clipEnd, asr };
         }
       );
 
-      const utterances: Utterance[] = [];
       const words: WordToken[] = [];
 
       for (const result of asrSegmentResults) {
@@ -226,18 +227,11 @@ const App = () => {
 
         if (filtered.length) {
           words.push(...filtered);
-          utterances.push({
-            speaker: result.seg.speaker,
-            start: result.seg.start,
-            end: result.seg.end,
-            words: filtered,
-            text: smartJoinTokens(filtered.map((w) => w.word))
-          });
         }
       }
 
-      const mergedUtterances = mergeUtterances(utterances);
       words.sort((a, b) => (a.start - b.start) || (a.end - b.end));
+      const mergedUtterances = buildUtterancesByDiarSegments(words, diarSegmentsForAttribution);
       const speakers = Array.from(new Set(mergedUtterances.map((u) => u.speaker)));
 
       saveDebugArtifacts(
@@ -430,7 +424,7 @@ const App = () => {
       const processor = context.createScriptProcessor(4096, 1, 1);
       const analyser = context.createAnalyser();
       analyser.fftSize = 1024;
-      analyser.smoothingTimeConstant = 0.85;
+      analyser.smoothingTimeConstant = 0.78;
       const analyserData = new Uint8Array(analyser.frequencyBinCount);
       const gain = context.createGain();
       gain.gain.value = 0;
@@ -455,13 +449,13 @@ const App = () => {
         session.bufferLength += input.length;
 
         const now = performance.now();
-        if (now - session.lastLevelAt > 60) {
+        if (now - session.lastLevelAt > 40) {
           let sum = 0;
           for (let i = 0; i < input.length; i += 1) {
             sum += input[i] * input[i];
           }
           const rms = Math.sqrt(sum / input.length);
-          setMicLevel(Math.min(1, rms * 2.4));
+          setMicLevel(Math.min(1, rms * 2.6));
           session.lastLevelAt = now;
         }
       };
@@ -534,6 +528,7 @@ const App = () => {
   };
 
   const progress = duration ? Math.min(1, currentTime / duration) : 0;
+  const playerStyle = { "--mic": isRecording ? micLevel : 0 } as CSSProperties;
 
   return (
     <div className="app-shell">
@@ -605,7 +600,10 @@ const App = () => {
         </aside>
 
         <section className="workspace">
-          <div className="player-card">
+          <div
+            className={isRecording ? "player-card recording" : "player-card"}
+            style={playerStyle}
+          >
           <div className="player-left">
             <Button
               type="text"
@@ -639,6 +637,11 @@ const App = () => {
                   {isRecording ? <StopOutlined /> : <AudioOutlined />}
                 </span>
               </button>
+              <div className={isRecording ? "mic-meter active" : "mic-meter"} aria-hidden="true">
+                {MIC_BARS.map((bar) => (
+                  <span key={bar} className="mic-bar" />
+                ))}
+              </div>
               <div className="record-meta">
                 <span className="record-label">
                   {isRecording ? "Recording" : "Mic test"}
