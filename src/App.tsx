@@ -28,9 +28,11 @@ import {
   extractWords,
   formatTime,
   hashHue,
-  mergeAdjacentSameSpeaker
+  mergeAdjacentSameSpeaker,
+  mergeUtterances
 } from "./lib/processing";
 import { diarizeAudio, transcribeAudio } from "./lib/api";
+import { saveDebugArtifacts } from "./lib/debug";
 
 const NAV_ITEMS = [
   "Text to Speech",
@@ -135,6 +137,8 @@ const App = () => {
         diarizeAudio(file)
       ]);
 
+      saveDebugArtifacts(title || id, asrResponse, diarResponse);
+
       const asrPayload = asrResponse?.asr ?? asrResponse;
       const words = extractWords(asrPayload);
       const diarSegments = mergeAdjacentSameSpeaker(extractDiarSegments(diarResponse));
@@ -169,11 +173,12 @@ const App = () => {
       const updated = prev.utterances.map((u) =>
         u === utterance ? { ...u, speaker: newSpeaker } : u
       );
+      const merged = mergeUtterances(updated);
       const map = { ...prev.speakerMap };
       if (!map[newSpeaker]) {
         map[newSpeaker] = `Speaker ${Object.keys(map).length + 1}`;
       }
-      return { ...prev, utterances: updated, speakerMap: map };
+      return { ...prev, utterances: merged, speakerMap: map };
     });
   };
 

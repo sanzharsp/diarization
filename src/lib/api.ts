@@ -12,6 +12,16 @@ const buildHeaders = () => {
   return headers;
 };
 
+const DIAR_PARAMS: Record<string, string> = {
+  return_rttm: "false",
+  exclusive: "true",
+  seg_threshold: "0.33",
+  seg_min_duration_off: "0.12",
+  cluster_threshold: "0.44",
+  min_cluster_size: "1",
+  embed_exclude_overlap: "true"
+};
+
 export const transcribeAudio = async (file: File) => {
   const form = new FormData();
   form.append("audio", file);
@@ -19,7 +29,7 @@ export const transcribeAudio = async (file: File) => {
   form.append("response_format", "verbose_json");
   form.append("timestamp_granularities", "word");
   form.append("prompt", "");
-  form.append("temperature", "1");
+  form.append("temperature", "0");
   form.append("include_raw", "false");
 
   const res = await fetch(`${API_BASE}/stt/transcribe`, {
@@ -39,7 +49,8 @@ export const diarizeAudio = async (file: File) => {
   const form = new FormData();
   form.append("audio", file);
 
-  const res = await fetch(`${API_BASE}/diarization/analyze`, {
+  const query = new URLSearchParams(DIAR_PARAMS).toString();
+  const res = await fetch(`${API_BASE}/diarization/analyze?${query}`, {
     method: "POST",
     headers: buildHeaders(),
     body: form

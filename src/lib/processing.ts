@@ -1,8 +1,9 @@
 import type { DiarSegment, Utterance, WordToken } from "./types";
 
-const WORD_CENTER_EPS = 0.0;
+const WORD_CENTER_EPS = 0.05;
 const MERGE_DIAR_GAP_SEC = 0.2;
-const MERGE_UTTERANCE_GAP_SEC = 0.35;
+// Increase to merge small pauses without over-merging long silences.
+const MERGE_UTTERANCE_GAP_SEC = 1.0;
 
 export const formatTime = (seconds: number) => {
   if (!Number.isFinite(seconds) || seconds < 0) return "00:00";
@@ -98,6 +99,25 @@ export const mergeAdjacentSameSpeaker = (segs: DiarSegment[]) => {
   return merged;
 };
 
+export const mergeUtterances = (
+  utterances: Utterance[],
+  maxGapSec: number = MERGE_UTTERANCE_GAP_SEC
+) => {
+  if (!utterances.length) return [];
+  const merged: Utterance[] = [{ ...utterances[0], words: [...utterances[0].words] }];
+  for (const u of utterances.slice(1)) {
+    const last = merged[merged.length - 1];
+    if (u.speaker === last.speaker && (u.start - last.end) <= maxGapSec) {
+      last.end = Math.max(last.end, u.end);
+      last.words = [...last.words, ...u.words];
+      last.text = smartJoinTokens(last.words.map((w) => w.word));
+    } else {
+      merged.push({ ...u, words: [...u.words] });
+    }
+  }
+  return merged;
+};
+
 export const buildUtterancesByDiarSegments = (words: WordToken[], diarSegs: DiarSegment[]) => {
   if (!diarSegs.length) return [];
   const utterances: Utterance[] = [];
@@ -133,19 +153,7 @@ export const buildUtterancesByDiarSegments = (words: WordToken[], diarSegs: Diar
     }
   }
 
-  if (!utterances.length) return [];
-  const merged: Utterance[] = [{ ...utterances[0], words: [...utterances[0].words] }];
-  for (const u of utterances.slice(1)) {
-    const last = merged[merged.length - 1];
-    if (u.speaker === last.speaker && (u.start - last.end) <= MERGE_UTTERANCE_GAP_SEC) {
-      last.end = Math.max(last.end, u.end);
-      last.words = [...last.words, ...u.words];
-      last.text = smartJoinTokens(last.words.map((w) => w.word));
-    } else {
-      merged.push({ ...u, words: [...u.words] });
-    }
-  }
-  return merged;
+  return mergeUtterances(utterances);
 };
 
 export const buildSpeakerMap = (speakers: string[]) => {
