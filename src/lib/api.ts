@@ -20,6 +20,82 @@ const buildHeaders = () => {
 export type DiarParams = Record<string, string | number>;
 export const DEFAULT_DIAR_PARAMS: DiarParams = {};
 
+const readStreamedJson = async (res: Response) => {
+  if (!res.body) {
+    return res.json();
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let fullText = "";
+  let lastJson: any = null;
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    const chunk = decoder.decode(value, { stream: true });
+    fullText += chunk;
+    buffer += chunk;
+
+    const lines = buffer.split(/\r?\n/);
+    buffer = lines.pop() ?? "";
+    for (let line of lines) {
+      line = line.trim();
+      if (!line) continue;
+      if (line.startsWith("data:")) {
+        line = line.slice(5).trim();
+      }
+      if (!line || line === "[DONE]") continue;
+      try {
+        lastJson = JSON.parse(line);
+      } catch {
+        // Ignore partial JSON lines; they'll be retried via the fullText fallback.
+      }
+    }
+  }
+
+  const tail = decoder.decode();
+  if (tail) {
+    fullText += tail;
+    buffer += tail;
+  }
+
+  const remaining = buffer.trim();
+  if (remaining) {
+    let line = remaining;
+    if (line.startsWith("data:")) line = line.slice(5).trim();
+    if (line && line !== "[DONE]") {
+      try {
+        lastJson = JSON.parse(line);
+      } catch {
+        // Fall through to fullText parsing.
+      }
+    }
+  }
+
+  if (lastJson != null) return lastJson;
+
+  const cleaned = fullText
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => (line.startsWith("data:") ? line.slice(5).trim() : line))
+    .filter((line) => line && line !== "[DONE]")
+    .join("\n");
+
+  try {
+    return JSON.parse(cleaned);
+  } catch {
+    // Ignore and try raw text below.
+  }
+
+  try {
+    return JSON.parse(fullText);
+  } catch {
+    throw new Error("Transcribe failed: invalid streaming JSON");
+  }
+};
+
 export const transcribeAudio = async (file: File) => {
   const form = new FormData();
   form.append("audio", file);
@@ -29,6 +105,7 @@ export const transcribeAudio = async (file: File) => {
   form.append("prompt", "");
   form.append("temperature", "0");
   form.append("include_raw", "false");
+  form.append("stream", "true");
 
   const res = await fetch(`${API_BASE}/stt/transcribe`, {
     method: "POST",
@@ -40,7 +117,7 @@ export const transcribeAudio = async (file: File) => {
     const text = await res.text();
     throw new Error(text || `Transcribe failed: ${res.status}`);
   }
-  return res.json();
+  return readStreamedJson(res);
 };
 
 const toQueryString = (params: DiarParams) => {
