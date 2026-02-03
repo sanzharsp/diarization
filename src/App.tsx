@@ -21,7 +21,7 @@ import {
   PlusOutlined,
   UploadOutlined
 } from "@ant-design/icons";
-import type { AsrDebugSegment, TranscriptItem, Utterance, WordToken } from "./lib/types";
+import type { AsrDebugSegment, DiarSegment, TranscriptItem, Utterance, WordToken } from "./lib/types";
 import {
   buildSpeakerMap,
   buildUtterancesByDiarSegments,
@@ -42,16 +42,20 @@ import {
   getMonoSlice
 } from "./lib/audio";
 
+const LIVE_DIAR_LABEL = "Live Diarization";
 const NAV_ITEMS = [
   "Text to Speech",
   "Agents",
   "Music",
   "Speech to Text",
+  LIVE_DIAR_LABEL,
   "Dubbing",
   "Voice Cloning",
   "ElevenReader"
 ];
 const MIC_BARS = Array.from({ length: 7 }, (_, i) => i);
+const DEFAULT_STREAM_WS_URL =
+  import.meta.env.VITE_DIAR_STREAM_WS_URL ?? "ws://localhost:9001/ws";
 
 const createId = () =>
   (typeof crypto !== "undefined" && "randomUUID" in crypto
@@ -71,6 +75,16 @@ const formatDurationMs = (ms: number) => {
   }
   return `${minutes.toString().padStart(2, "0")}:${seconds.toString().padStart(2, "0")}`;
 };
+
+const STREAM_TARGET_SAMPLE_RATE = 16000;
+const STREAM_PROCESSOR_SIZE = 4096;
+const STREAM_SEGMENT_LIMIT = 240;
+const LIVE_ASR_CHUNK_SEC = 6;
+const LIVE_ASR_OVERLAP_SEC = 1;
+const LIVE_ASR_WORD_LIMIT = 2000;
+const LIVE_UTTERANCE_MERGE_GAP_SEC = 0.6;
+const LIVE_ASR_CHUNK_SAMPLES = Math.round(LIVE_ASR_CHUNK_SEC * STREAM_TARGET_SAMPLE_RATE);
+const LIVE_ASR_OVERLAP_SAMPLES = Math.round(LIVE_ASR_OVERLAP_SEC * STREAM_TARGET_SAMPLE_RATE);
 
 const ASR_SEGMENT_PADDING_SEC = 1.0;
 const ASR_CONCURRENCY = 40;
@@ -102,6 +116,65 @@ const mapWithConcurrency = async <T, R>(
   return results;
 };
 
+const downsampleBuffer = (buffer: Float32Array, sampleRate: number, outRate: number) => {
+  if (outRate >= sampleRate) return buffer.slice();
+  const ratio = sampleRate / outRate;
+  const newLength = Math.round(buffer.length / ratio);
+  const result = new Float32Array(newLength);
+  let offsetResult = 0;
+  let offsetBuffer = 0;
+  while (offsetResult < result.length) {
+    const nextOffsetBuffer = Math.round((offsetResult + 1) * ratio);
+    let accum = 0;
+    let count = 0;
+    for (let i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i += 1) {
+      accum += buffer[i];
+      count += 1;
+    }
+    result[offsetResult] = count ? accum / count : 0;
+    offsetResult += 1;
+    offsetBuffer = nextOffsetBuffer;
+  }
+  return result;
+};
+
+const floatTo16BitPCM = (buffer: Float32Array) => {
+  const output = new Int16Array(buffer.length);
+  for (let i = 0; i < buffer.length; i += 1) {
+    const s = Math.max(-1, Math.min(1, buffer[i]));
+    output[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+  }
+  return output;
+};
+
+const normalizeStreamSegments = (segments: any[]): DiarSegment[] => {
+  const out: DiarSegment[] = [];
+  for (const seg of segments) {
+    if (!seg) continue;
+    const speaker = seg.speaker ?? seg.spk_id ?? seg.spk ?? seg.speaker_id ?? "unknown";
+    const start = seg.start ?? seg.seg_begin ?? seg.begin;
+    const end = seg.end ?? seg.seg_end ?? seg.finish;
+    if (speaker == null || start == null || end == null) continue;
+    const s = Number(start);
+    const e = Number(end);
+    if (!Number.isFinite(s) || !Number.isFinite(e)) continue;
+    out.push({ speaker: String(speaker), start: s, end: e });
+  }
+  return out;
+};
+
+const mergeStreamSegments = (prev: DiarSegment[], incoming: DiarSegment[]) => {
+  if (!incoming.length) return prev;
+  const merged = mergeAdjacentSameSpeaker(
+    [...prev, ...incoming].sort((a, b) => (a.start - b.start) || (a.end - b.end)),
+    0.2
+  );
+  if (merged.length > STREAM_SEGMENT_LIMIT) {
+    return merged.slice(-STREAM_SEGMENT_LIMIT);
+  }
+  return merged;
+};
+
 type RecorderSession = {
   context: AudioContext;
   source: MediaStreamAudioSourceNode;
@@ -116,7 +189,20 @@ type RecorderSession = {
   lastLevelAt: number;
 };
 
+type StreamSession = {
+  context: AudioContext;
+  source: MediaStreamAudioSourceNode;
+  processor: ScriptProcessorNode;
+  analyser: AnalyserNode;
+  analyserData: Uint8Array;
+  gain: GainNode;
+  stream: MediaStream;
+  ws: WebSocket;
+  lastLevelAt: number;
+};
+
 const App = () => {
+  const [activeNav, setActiveNav] = useState("Speech to Text");
   const [transcripts, setTranscripts] = useState<TranscriptItem[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [renameState, setRenameState] = useState<{
@@ -133,10 +219,30 @@ const App = () => {
   const [playbackLevel, setPlaybackLevel] = useState(0);
   const [minSpeakers, setMinSpeakers] = useState<number | null>(null);
   const [maxSpeakers, setMaxSpeakers] = useState<number | null>(null);
+  const [diarProfile, setDiarProfile] = useState<string | null>("general");
   const [processingNow, setProcessingNow] = useState(() => Date.now());
+  const [streamUrl, setStreamUrl] = useState(DEFAULT_STREAM_WS_URL);
+  const [streamPreset, setStreamPreset] = useState<"low" | "very_high">("low");
+  const [streamStatus, setStreamStatus] = useState<"idle" | "connecting" | "streaming" | "error">("idle");
+  const [streamError, setStreamError] = useState<string | null>(null);
+  const [streamSegments, setStreamSegments] = useState<DiarSegment[]>([]);
+  const [streamElapsedMs, setStreamElapsedMs] = useState(0);
+  const [streamMicLevel, setStreamMicLevel] = useState(0);
+  const [streamInfo, setStreamInfo] = useState<Record<string, any> | null>(null);
+  const [liveAsrWords, setLiveAsrWords] = useState<WordToken[]>([]);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const recorderRef = useRef<RecorderSession | null>(null);
   const recordTimerRef = useRef<number | null>(null);
+  const streamWsRef = useRef<WebSocket | null>(null);
+  const streamSessionRef = useRef<StreamSession | null>(null);
+  const streamTimerRef = useRef<number | null>(null);
+  const streamStartedAtRef = useRef<number | null>(null);
+  const streamActiveRef = useRef(false);
+  const liveAsrBufferRef = useRef<Float32Array[]>([]);
+  const liveAsrBufferedSamplesRef = useRef(0);
+  const liveAsrPendingRef = useRef(false);
+  const liveAsrOffsetSecRef = useRef(0);
+  const liveAsrRunIdRef = useRef(0);
   const waveCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const waveAnimRef = useRef<number | null>(null);
   const playbackRafRef = useRef<number | null>(null);
@@ -145,6 +251,7 @@ const App = () => {
   const playbackDataRef = useRef<Uint8Array | null>(null);
 
   const activeTranscript = transcripts.find((t) => t.id === activeId) ?? transcripts[0];
+  const isStreaming = streamStatus === "streaming";
 
   useEffect(() => {
     if (!activeTranscript || activeTranscript.status !== "processing") return;
@@ -152,6 +259,12 @@ const App = () => {
     const tick = window.setInterval(() => setProcessingNow(Date.now()), 1000);
     return () => window.clearInterval(tick);
   }, [activeTranscript?.id, activeTranscript?.status]);
+
+  useEffect(() => {
+    if (activeNav === LIVE_DIAR_LABEL) return;
+    if (streamStatus === "idle") return;
+    void stopStreaming();
+  }, [activeNav, streamStatus]);
 
   const processingElapsedMs = useMemo(() => {
     if (!activeTranscript?.processingStartedAt) return null;
@@ -169,6 +282,27 @@ const App = () => {
     }
     return null;
   }, [activeTranscript, processingNow]);
+
+  const streamSpeakerLabels = useMemo(() => {
+    const map: Record<string, string> = {};
+    let idx = 1;
+    for (const seg of streamSegments) {
+      if (!map[seg.speaker]) {
+        map[seg.speaker] = `Спикер ${idx}`;
+        idx += 1;
+      }
+    }
+    return map;
+  }, [streamSegments]);
+
+  const liveAsrUtterances = useMemo(() => {
+    if (!liveAsrWords.length || !streamSegments.length) return [];
+    return buildUtterancesByDiarSegments(
+      liveAsrWords,
+      streamSegments,
+      LIVE_UTTERANCE_MERGE_GAP_SEC
+    );
+  }, [liveAsrWords, streamSegments]);
 
   const speakerIds = useMemo(() => {
     if (!activeTranscript) return [];
@@ -221,6 +355,312 @@ const App = () => {
     setTranscripts((prev) => prev.map((t) => (t.id === id ? updater(t) : t)));
   };
 
+  const resetLiveAsrState = () => {
+    liveAsrBufferRef.current = [];
+    liveAsrBufferedSamplesRef.current = 0;
+    liveAsrPendingRef.current = false;
+    liveAsrOffsetSecRef.current = 0;
+    setLiveAsrWords([]);
+  };
+
+  const consumeLiveAsrSamples = (count: number) => {
+    const buffers = liveAsrBufferRef.current;
+    const output = new Float32Array(count);
+    let offset = 0;
+    while (offset < count && buffers.length > 0) {
+      const buf = buffers[0];
+      const take = Math.min(buf.length, count - offset);
+      output.set(buf.subarray(0, take), offset);
+      offset += take;
+      if (take === buf.length) {
+        buffers.shift();
+      } else {
+        buffers[0] = buf.subarray(take);
+      }
+    }
+    liveAsrBufferedSamplesRef.current = Math.max(0, liveAsrBufferedSamplesRef.current - count);
+    return output;
+  };
+
+  const takeLiveAsrChunk = () => {
+    if (liveAsrBufferedSamplesRef.current < LIVE_ASR_CHUNK_SAMPLES) return null;
+    const chunk = consumeLiveAsrSamples(LIVE_ASR_CHUNK_SAMPLES);
+    if (LIVE_ASR_OVERLAP_SAMPLES > 0) {
+      const overlap = chunk.subarray(chunk.length - LIVE_ASR_OVERLAP_SAMPLES);
+      liveAsrBufferRef.current.unshift(overlap);
+      liveAsrBufferedSamplesRef.current += overlap.length;
+    }
+    return chunk;
+  };
+
+  const drainLiveAsrBuffer = (runId: number) => {
+    if (!streamActiveRef.current) return;
+    if (liveAsrPendingRef.current) return;
+    const chunk = takeLiveAsrChunk();
+    if (!chunk) return;
+
+    liveAsrPendingRef.current = true;
+    const chunkStartSec = liveAsrOffsetSecRef.current;
+    liveAsrOffsetSecRef.current +=
+      (LIVE_ASR_CHUNK_SAMPLES - LIVE_ASR_OVERLAP_SAMPLES) / STREAM_TARGET_SAMPLE_RATE;
+
+    const wavBuffer = encodeWav(chunk, STREAM_TARGET_SAMPLE_RATE);
+    const blob = new Blob([wavBuffer], { type: "audio/wav" });
+    const segFile = new File([blob], `live_asr_${chunkStartSec.toFixed(2)}.wav`, {
+      type: "audio/wav"
+    });
+
+    transcribeAudio(segFile)
+      .then((asr) => {
+        if (liveAsrRunIdRef.current !== runId) return;
+        const asrPayload = asr?.asr ?? asr;
+        const rawWords = extractWords(asrPayload);
+        const relativeDrop = chunkStartSec > 0 ? LIVE_ASR_OVERLAP_SEC : 0;
+        const adjusted = rawWords
+          .filter((w) => ((w.start + w.end) / 2) >= relativeDrop)
+          .map((w) => ({
+            ...w,
+            start: w.start + chunkStartSec,
+            end: w.end + chunkStartSec
+          }));
+
+        if (!adjusted.length) return;
+        setLiveAsrWords((prev) => {
+          const merged = [...prev, ...adjusted].sort(
+            (a, b) => (a.start - b.start) || (a.end - b.end)
+          );
+          if (merged.length > LIVE_ASR_WORD_LIMIT) {
+            return merged.slice(-LIVE_ASR_WORD_LIMIT);
+          }
+          return merged;
+        });
+      })
+      .catch((err: any) => {
+        if (liveAsrRunIdRef.current !== runId) return;
+        setStreamError((prev) => prev || err?.message || "Ошибка live ASR.");
+      })
+      .finally(() => {
+        if (liveAsrRunIdRef.current !== runId) return;
+        liveAsrPendingRef.current = false;
+        drainLiveAsrBuffer(runId);
+      });
+  };
+
+  const buildStreamUrl = () => {
+    if (!streamUrl) return "";
+    try {
+      const url = new URL(streamUrl, window.location.href);
+      url.searchParams.set("preset", streamPreset);
+      url.searchParams.set("send_segments", "true");
+      url.searchParams.set("debug", "false");
+      return url.toString();
+    } catch {
+      return streamUrl;
+    }
+  };
+
+  const stopStreaming = async (nextStatus: "idle" | "error" = "idle") => {
+    streamActiveRef.current = false;
+    liveAsrRunIdRef.current += 1;
+    resetLiveAsrState();
+
+    const session = streamSessionRef.current;
+    if (session) {
+      session.processor.disconnect();
+      session.source.disconnect();
+      session.analyser.disconnect();
+      session.gain.disconnect();
+      session.stream.getTracks().forEach((track) => track.stop());
+      session.processor.onaudioprocess = null;
+      streamSessionRef.current = null;
+      try {
+        await session.context.close();
+      } catch {
+        // ignore close errors
+      }
+    }
+
+    const ws = streamWsRef.current;
+    if (ws) {
+      ws.onopen = null;
+      ws.onmessage = null;
+      ws.onerror = null;
+      ws.onclose = null;
+      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+        try {
+          ws.close();
+        } catch {
+          // ignore close errors
+        }
+      }
+      streamWsRef.current = null;
+    }
+
+    if (streamTimerRef.current) {
+      window.clearInterval(streamTimerRef.current);
+      streamTimerRef.current = null;
+    }
+
+    setStreamMicLevel(0);
+    setStreamStatus(nextStatus);
+  };
+
+  const startStreaming = async () => {
+    if (streamStatus === "connecting" || streamStatus === "streaming") return;
+    if (!navigator.mediaDevices?.getUserMedia) {
+      message.error("Microphone not supported in this browser.");
+      return;
+    }
+    if (!streamUrl) {
+      message.error("Stream WS URL не задан.");
+      return;
+    }
+    if (isRecording) {
+      message.warning("Остановите запись, чтобы запустить стрим.");
+      return;
+    }
+
+    const runId = liveAsrRunIdRef.current + 1;
+    liveAsrRunIdRef.current = runId;
+    resetLiveAsrState();
+    setStreamError(null);
+    setStreamSegments([]);
+    setStreamInfo(null);
+    setStreamStatus("connecting");
+    const wsTarget = buildStreamUrl();
+
+    let ws: WebSocket;
+    try {
+      ws = new WebSocket(wsTarget);
+    } catch (err: any) {
+      setStreamError(err?.message || "Некорректный WS URL.");
+      setStreamStatus("error");
+      return;
+    }
+
+    ws.binaryType = "arraybuffer";
+    streamWsRef.current = ws;
+
+    ws.onopen = async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            channelCount: 1,
+            sampleRate: STREAM_TARGET_SAMPLE_RATE,
+            sampleSize: 16,
+            echoCancellation: false,
+            noiseSuppression: false,
+            autoGainControl: false
+          }
+        });
+
+        const context = new AudioContext({ sampleRate: STREAM_TARGET_SAMPLE_RATE });
+        await context.resume();
+        const source = context.createMediaStreamSource(stream);
+        const processor = context.createScriptProcessor(STREAM_PROCESSOR_SIZE, 1, 1);
+        const analyser = context.createAnalyser();
+        analyser.fftSize = 1024;
+        analyser.smoothingTimeConstant = 0.78;
+        const analyserData = new Uint8Array(analyser.frequencyBinCount);
+        const gain = context.createGain();
+        gain.gain.value = 0;
+
+        const session: StreamSession = {
+          context,
+          source,
+          processor,
+          analyser,
+          analyserData,
+          gain,
+          stream,
+          ws,
+          lastLevelAt: 0
+        };
+
+        processor.onaudioprocess = (event) => {
+          const input = event.inputBuffer.getChannelData(0);
+          const inputRate = event.inputBuffer.sampleRate;
+          const downsampled = downsampleBuffer(input, inputRate, STREAM_TARGET_SAMPLE_RATE);
+          const pcm16 = floatTo16BitPCM(downsampled);
+          if (ws.readyState === WebSocket.OPEN && pcm16.length > 0) {
+            ws.send(pcm16.buffer);
+          }
+          liveAsrBufferRef.current.push(downsampled);
+          liveAsrBufferedSamplesRef.current += downsampled.length;
+          drainLiveAsrBuffer(runId);
+
+          const now = performance.now();
+          if (now - session.lastLevelAt > 40) {
+            let sum = 0;
+            for (let i = 0; i < input.length; i += 1) {
+              sum += input[i] * input[i];
+            }
+            const rms = Math.sqrt(sum / input.length);
+            setStreamMicLevel(Math.min(1, rms * 2.6));
+            session.lastLevelAt = now;
+          }
+        };
+
+        source.connect(analyser);
+        source.connect(processor);
+        processor.connect(gain);
+        gain.connect(context.destination);
+
+        streamSessionRef.current = session;
+        streamStartedAtRef.current = Date.now();
+        streamActiveRef.current = true;
+        setStreamElapsedMs(0);
+        if (streamTimerRef.current) {
+          window.clearInterval(streamTimerRef.current);
+        }
+        streamTimerRef.current = window.setInterval(() => {
+          if (!streamStartedAtRef.current) return;
+          setStreamElapsedMs(Date.now() - streamStartedAtRef.current);
+        }, 1000);
+
+        setStreamStatus("streaming");
+      } catch (err: any) {
+        setStreamError(err?.message || "Не удалось запустить микрофон.");
+        await stopStreaming("error");
+      }
+    };
+
+    ws.onmessage = (event) => {
+      if (typeof event.data !== "string") return;
+      let payload: any;
+      try {
+        payload = JSON.parse(event.data);
+      } catch {
+        return;
+      }
+      if (payload?.type === "hello") {
+        setStreamInfo(payload);
+        return;
+      }
+      if (payload?.type === "error") {
+        setStreamError(payload.detail || "Ошибка стрима.");
+        void stopStreaming("error");
+        return;
+      }
+      if (payload?.type === "update") {
+        const incoming = normalizeStreamSegments(Array.isArray(payload.segments) ? payload.segments : []);
+        if (incoming.length) {
+          setStreamSegments((prev) => mergeStreamSegments(prev, incoming));
+        }
+      }
+    };
+
+    ws.onerror = () => {
+      setStreamError("Ошибка соединения WebSocket.");
+      void stopStreaming("error");
+    };
+
+    ws.onclose = () => {
+      setStreamError((prev) => prev || "Соединение закрыто.");
+      void stopStreaming("error");
+    };
+  };
+
   const handleUpload = async (file: File, predecoded?: AudioBuffer) => {
     const processingStartedAt = Date.now();
     const id = createId();
@@ -252,6 +692,9 @@ const App = () => {
       }
       if (maxSpeakers != null) {
         diarParams.max_speakers = maxSpeakers;
+      }
+      if (diarProfile) {
+        diarParams.profile = diarProfile;
       }
 
       const [diarResponse, audioBuffer] = await Promise.all([
@@ -613,6 +1056,12 @@ const App = () => {
     };
   }, []);
 
+  useEffect(() => {
+    return () => {
+      void stopStreaming();
+    };
+  }, []);
+
   const startRecording = async () => {
     if (!navigator.mediaDevices?.getUserMedia) {
       message.error("Microphone not supported in this browser.");
@@ -746,8 +1195,9 @@ const App = () => {
 
   const progress = duration ? Math.min(1, currentTime / duration) : 0;
   const voiceLevel = isRecording ? micLevel : isPlaying ? playbackLevel : 0;
+  const activeMicLevel = isRecording ? micLevel : isStreaming ? streamMicLevel : 0;
   const appStyle = {
-    "--mic": isRecording ? micLevel : 0,
+    "--mic": activeMicLevel,
     "--voice": voiceLevel
   } as CSSProperties;
 
@@ -757,14 +1207,16 @@ const App = () => {
         {NAV_ITEMS.map((item) => (
           <button
             key={item}
-            className={item === "Speech to Text" ? "nav-pill active" : "nav-pill"}
+            className={item === activeNav ? "nav-pill active" : "nav-pill"}
             type="button"
+            onClick={() => setActiveNav(item)}
           >
             {item}
           </button>
         ))}
       </header>
 
+      {activeNav === "Speech to Text" && (
       <div className="main-grid">
         <aside className="sidebar">
           <div className="sidebar-header">
@@ -827,6 +1279,22 @@ const App = () => {
                 onChange={(value) =>
                   setMaxSpeakers(typeof value === "number" ? value : null)
                 }
+              />
+            </div>
+            <div className="control-row">
+              <span className="control-label">Profile</span>
+              <Select
+                size="small"
+                value={diarProfile ?? undefined}
+                placeholder="auto"
+                allowClear
+                className="diar-select"
+                onChange={(value) => setDiarProfile(typeof value === "string" ? value : null)}
+                options={[
+                  { value: "general", label: "general" },
+                  { value: "meeting", label: "meeting" },
+                  { value: "telephonic", label: "telephonic" }
+                ]}
               />
             </div>
             <span className="control-hint">Пусто = авто</span>
@@ -1075,6 +1543,162 @@ const App = () => {
           </div>
         </section>
       </div>
+      )}
+
+      {activeNav === LIVE_DIAR_LABEL && (
+      <div className="main-grid">
+        <aside className="sidebar">
+          <div className="sidebar-header">
+            <Typography.Title level={5} className="sidebar-title">
+              Live stream
+            </Typography.Title>
+          </div>
+
+          <div className="sidebar-controls">
+            <div className="control-row">
+              <span className="control-label">WS URL</span>
+              <Input
+                size="small"
+                value={streamUrl}
+                placeholder="ws://host:9001/ws"
+                className="stream-input"
+                onChange={(event) => setStreamUrl(event.target.value)}
+              />
+            </div>
+            <div className="control-row">
+              <span className="control-label">Preset</span>
+              <Select
+                size="small"
+                value={streamPreset}
+                className="stream-select"
+                onChange={(value) => setStreamPreset(value as "low" | "very_high")}
+                options={[
+                  { value: "low", label: "low" },
+                  { value: "very_high", label: "very_high" }
+                ]}
+              />
+            </div>
+            <div className="control-row">
+              <span className="control-label">Status</span>
+              <span className={`stream-status-text ${isStreaming ? "live" : ""}`}>
+                {streamStatus === "connecting" ? "connecting" : streamStatus}
+              </span>
+            </div>
+          </div>
+
+          <div className="stream-meter">
+            <div className={isStreaming ? "mic-meter active" : "mic-meter"} aria-hidden="true">
+              {MIC_BARS.map((bar) => (
+                <span key={bar} className="mic-bar" />
+              ))}
+            </div>
+            <span className="stream-time">
+              {isStreaming ? `On air ${formatDurationMs(streamElapsedMs)}` : "Mic idle"}
+            </span>
+          </div>
+
+          <div className="sidebar-footer">
+            <div className="stream-actions">
+              <Button
+                type="primary"
+                size="large"
+                block
+                disabled={isStreaming || streamStatus === "connecting"}
+                onClick={() => void startStreaming()}
+              >
+                Start stream
+              </Button>
+              <Button
+                danger
+                size="large"
+                block
+                disabled={!isStreaming && streamStatus !== "connecting"}
+                onClick={() => void stopStreaming("idle")}
+              >
+                Stop stream
+              </Button>
+            </div>
+          </div>
+        </aside>
+
+        <section className="workspace">
+          <div className="transcript-card">
+            <div className="stream-header">
+              <div>
+                <Typography.Title level={4} className="stream-title">
+                  Streaming diarization
+                </Typography.Title>
+                <Typography.Text className="stream-subtitle">
+                  Сегменты появляются по мере готовности.
+                </Typography.Text>
+              </div>
+              <div className="stream-meta">
+                <span className={`stream-badge ${isStreaming ? "live" : ""}`}>
+                  {isStreaming ? "LIVE" : streamStatus.toUpperCase()}
+                </span>
+                {streamInfo?.model && <span>Model: {streamInfo.model}</span>}
+                {streamSegments.length > 0 && <span>Segments: {streamSegments.length}</span>}
+              </div>
+            </div>
+
+            {streamError && (
+              <Typography.Text type="danger">
+                {streamError}
+              </Typography.Text>
+            )}
+
+            {liveAsrUtterances.length > 0 ? (
+              <div className="stream-segment-list">
+                {liveAsrUtterances.map((utterance, index) => {
+                  const hue = hashHue(utterance.speaker);
+                  return (
+                    <div
+                      key={`${utterance.speaker}-${utterance.start}-${utterance.end}-${index}`}
+                      className="stream-segment"
+                    >
+                      <div className="stream-segment-meta">
+                        <span
+                          className="stream-asr-speaker"
+                          style={{
+                            background: `linear-gradient(120deg, hsl(${hue} 70% 55%), hsl(${(hue + 60) % 360} 70% 55%))`
+                          }}
+                        >
+                          {streamSpeakerLabels[utterance.speaker] ?? "Спикер"}
+                        </span>
+                        <span className="stream-time">
+                          {formatTime(utterance.start)} - {formatTime(utterance.end)}
+                        </span>
+                      </div>
+                      <Typography.Paragraph className="stream-segment-text">
+                        {utterance.text}
+                      </Typography.Paragraph>
+                    </div>
+                  );
+                })}
+              </div>
+            ) : (
+              <Empty
+                description={
+                  streamStatus === "streaming"
+                    ? "Текст появится после первых чанков ASR."
+                    : "Запустите стрим, чтобы увидеть диалог."
+                }
+              />
+            )}
+          </div>
+        </section>
+      </div>
+      )}
+
+      {activeNav !== "Speech to Text" && activeNav !== LIVE_DIAR_LABEL && (
+      <div className="main-grid">
+        <section className="workspace" style={{ gridColumn: "1 / -1" }}>
+          <div className="transcript-card">
+            <Empty description="Раздел в разработке." />
+          </div>
+        </section>
+      </div>
+      )}
 
       <audio
         ref={audioRef}
