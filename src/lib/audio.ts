@@ -39,3 +39,56 @@ export const getMonoSlice = (buffer: AudioBuffer, startSec: number, endSec: numb
 
   return output;
 };
+
+export const resampleLinear = (
+  input: Float32Array,
+  inputRate: number,
+  outputRate: number
+) => {
+  if (!input.length || inputRate === outputRate) return input;
+  const ratio = inputRate / outputRate;
+  const outLength = Math.max(1, Math.round(input.length / ratio));
+  const output = new Float32Array(outLength);
+
+  for (let i = 0; i < outLength; i += 1) {
+    const srcPos = i * ratio;
+    const idx = Math.floor(srcPos);
+    const frac = srcPos - idx;
+    const s0 = input[idx] ?? 0;
+    const s1 = input[idx + 1] ?? s0;
+    output[i] = s0 + (s1 - s0) * frac;
+  }
+
+  return output;
+};
+
+export const normalizePcm = (
+  input: Float32Array,
+  targetPeak: number = 0.98,
+  minPeak: number = 1e-3
+) => {
+  if (!input.length) return input;
+  let mean = 0;
+  for (let i = 0; i < input.length; i += 1) {
+    mean += input[i];
+  }
+  mean /= input.length;
+
+  let peak = 0;
+  for (let i = 0; i < input.length; i += 1) {
+    const v = input[i] - mean;
+    const a = Math.abs(v);
+    if (a > peak) peak = a;
+  }
+
+  const gain = peak > minPeak ? targetPeak / peak : 1;
+  const output = new Float32Array(input.length);
+  for (let i = 0; i < input.length; i += 1) {
+    let v = (input[i] - mean) * gain;
+    if (v > 1) v = 1;
+    if (v < -1) v = -1;
+    output[i] = v;
+  }
+
+  return output;
+};

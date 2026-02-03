@@ -75,22 +75,29 @@ export const extractDiarSegments = (diar: any): DiarSegment[] => {
       : [];
   const out: DiarSegment[] = [];
   for (const s of segs) {
-    if (!s || s.speaker == null || s.start == null || s.end == null) continue;
+    if (!s) continue;
+    const speaker = s.speaker ?? s.spk_id ?? s.spk ?? s.speaker_id;
+    const start = s.start ?? s.seg_begin ?? s.begin;
+    const end = s.end ?? s.seg_end ?? s.finish;
+    if (speaker == null || start == null || end == null) continue;
     out.push({
-      speaker: String(s.speaker),
-      start: Number(s.start),
-      end: Number(s.end)
+      speaker: String(speaker),
+      start: Number(start),
+      end: Number(end)
     });
   }
   return out.sort((a, b) => (a.start - b.start) || (a.end - b.end));
 };
 
-export const mergeAdjacentSameSpeaker = (segs: DiarSegment[]) => {
+export const mergeAdjacentSameSpeaker = (
+  segs: DiarSegment[],
+  maxGapSec: number = MERGE_DIAR_GAP_SEC
+) => {
   if (!segs.length) return [];
   const merged: DiarSegment[] = [{ ...segs[0] }];
   for (const seg of segs.slice(1)) {
     const last = merged[merged.length - 1];
-    if (seg.speaker === last.speaker && (seg.start - last.end) <= MERGE_DIAR_GAP_SEC) {
+    if (seg.speaker === last.speaker && (seg.start - last.end) <= maxGapSec) {
       last.end = Math.max(last.end, seg.end);
     } else {
       merged.push({ ...seg });
@@ -118,7 +125,11 @@ export const mergeUtterances = (
   return merged;
 };
 
-export const buildUtterancesByDiarSegments = (words: WordToken[], diarSegs: DiarSegment[]) => {
+export const buildUtterancesByDiarSegments = (
+  words: WordToken[],
+  diarSegs: DiarSegment[],
+  maxGapSec: number = MERGE_UTTERANCE_GAP_SEC
+) => {
   if (!diarSegs.length) return [];
   const utterances: Utterance[] = [];
   let i = 0;
@@ -153,7 +164,7 @@ export const buildUtterancesByDiarSegments = (words: WordToken[], diarSegs: Diar
     }
   }
 
-  return mergeUtterances(utterances);
+  return mergeUtterances(utterances, maxGapSec);
 };
 
 export const buildSpeakerMap = (speakers: string[]) => {

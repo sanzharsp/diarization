@@ -3,6 +3,7 @@ import {
   Button,
   Empty,
   Input,
+  InputNumber,
   List,
   Modal,
   Select,
@@ -20,7 +21,7 @@ import {
   PlusOutlined,
   UploadOutlined
 } from "@ant-design/icons";
-import type { TranscriptItem, Utterance, WordToken } from "./lib/types";
+import type { AsrDebugSegment, TranscriptItem, Utterance, WordToken } from "./lib/types";
 import {
   buildSpeakerMap,
   buildUtterancesByDiarSegments,
@@ -32,11 +33,14 @@ import {
   mergeAdjacentSameSpeaker,
   mergeUtterances
 } from "./lib/processing";
-import { DIAR_PRESETS, diarizeAudio, transcribeAudio } from "./lib/api";
-import type { DiarParams } from "./lib/api";
-import { saveDebugArtifacts } from "./lib/debug";
+import { diarizeAudio, transcribeAudio } from "./lib/api";
+import { safeName, saveDebugArtifacts } from "./lib/debug";
 import { encodeWav } from "./lib/wav";
-import { createAudioBufferFromMono, decodeAudioFile, getMonoSlice } from "./lib/audio";
+import {
+  createAudioBufferFromMono,
+  decodeAudioFile,
+  getMonoSlice
+} from "./lib/audio";
 
 const NAV_ITEMS = [
   "Text to Speech",
@@ -54,13 +58,31 @@ const createId = () =>
     ? crypto.randomUUID()
     : `t_${Date.now()}_${Math.random().toString(16).slice(2)}`);
 
-const ASR_SEGMENT_PADDING_SEC = 0.2;
-const ASR_CONCURRENCY = 3;
+const formatDurationMs = (ms: number) => {
+  if (!Number.isFinite(ms) || ms < 0) return "00:00";
+  const totalSeconds = Math.floor(ms / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours > 0) {
+    return `${hours.toString().padStart(2, "0")}:${minutes
+      .toString()
+      .padStart(2, "0")}:${seconds.toString().padStart(2, "0")}`;
+  }
+  return `${minutes.toString().padStart(2, "0")}:${seconds.toString().padStart(2, "0")}`;
+};
+
+const ASR_SEGMENT_PADDING_SEC = 1.0;
+const ASR_CONCURRENCY = 40;
+const ASR_DIAR_MERGE_GAP_SEC = Number.POSITIVE_INFINITY;
+const DEBUG_SAVE_ASR_SEGMENTS = import.meta.env.VITE_DEBUG_SAVE_ASR_SEGMENTS === "1";
+const UI_UTTERANCE_MERGE_GAP_SEC = Number.POSITIVE_INFINITY;
 
 const mapWithConcurrency = async <T, R>(
   items: T[],
   limit: number,
-  fn: (item: T, index: number) => Promise<R>
+  fn: (item: T, index: number) => Promise<R>,
+  onProgress?: (result: R, index: number) => void
 ) => {
   const results: R[] = new Array(items.length);
   let nextIndex = 0;
@@ -71,6 +93,9 @@ const mapWithConcurrency = async <T, R>(
       if (current >= items.length) break;
       nextIndex += 1;
       results[current] = await fn(items[current], current);
+      if (onProgress) {
+        onProgress(results[current], current);
+      }
     }
   });
   await Promise.all(workers);
@@ -106,7 +131,9 @@ const App = () => {
   const [recordingTime, setRecordingTime] = useState(0);
   const [micLevel, setMicLevel] = useState(0);
   const [playbackLevel, setPlaybackLevel] = useState(0);
-  const [diarPreset, setDiarPreset] = useState<keyof typeof DIAR_PRESETS>("balanced");
+  const [minSpeakers, setMinSpeakers] = useState<number | null>(null);
+  const [maxSpeakers, setMaxSpeakers] = useState<number | null>(null);
+  const [processingNow, setProcessingNow] = useState(() => Date.now());
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const recorderRef = useRef<RecorderSession | null>(null);
   const recordTimerRef = useRef<number | null>(null);
@@ -118,6 +145,30 @@ const App = () => {
   const playbackDataRef = useRef<Uint8Array | null>(null);
 
   const activeTranscript = transcripts.find((t) => t.id === activeId) ?? transcripts[0];
+
+  useEffect(() => {
+    if (!activeTranscript || activeTranscript.status !== "processing") return;
+    setProcessingNow(Date.now());
+    const tick = window.setInterval(() => setProcessingNow(Date.now()), 1000);
+    return () => window.clearInterval(tick);
+  }, [activeTranscript?.id, activeTranscript?.status]);
+
+  const processingElapsedMs = useMemo(() => {
+    if (!activeTranscript?.processingStartedAt) return null;
+    if (activeTranscript.status === "processing") {
+      return Math.max(0, processingNow - activeTranscript.processingStartedAt);
+    }
+    if (activeTranscript.processingMs != null) {
+      return Math.max(0, activeTranscript.processingMs);
+    }
+    if (activeTranscript.processingFinishedAt) {
+      return Math.max(
+        0,
+        activeTranscript.processingFinishedAt - activeTranscript.processingStartedAt
+      );
+    }
+    return null;
+  }, [activeTranscript, processingNow]);
 
   const speakerIds = useMemo(() => {
     if (!activeTranscript) return [];
@@ -171,6 +222,7 @@ const App = () => {
   };
 
   const handleUpload = async (file: File, predecoded?: AudioBuffer) => {
+    const processingStartedAt = Date.now();
     const id = createId();
     const title = file.name.replace(/\.[^/.]+$/, "");
     const createdAt = new Date().toISOString();
@@ -181,27 +233,97 @@ const App = () => {
       title: title || "Untitled",
       createdAt,
       status: "processing",
+      processingStartedAt,
       audioUrl,
       utterances: [],
       diarSegments: [],
       words: [],
-      speakerMap: {}
+      speakerMap: {},
+      debugAsrSegments: []
     };
 
     setTranscripts((prev) => [newItem, ...prev]);
     setActiveId(id);
 
     try {
-      const diarParams: DiarParams = DIAR_PRESETS[diarPreset];
+      const diarParams: Record<string, string | number> = {};
+      if (minSpeakers != null) {
+        diarParams.min_speakers = minSpeakers;
+      }
+      if (maxSpeakers != null) {
+        diarParams.max_speakers = maxSpeakers;
+      }
+
       const [diarResponse, audioBuffer] = await Promise.all([
         diarizeAudio(file, diarParams),
         predecoded ? Promise.resolve(predecoded) : decodeAudioFile(file)
       ]);
 
-      const diarSegments = mergeAdjacentSameSpeaker(extractDiarSegments(diarResponse));
-      const diarSegmentsForAttribution = diarSegments;
-      const asrSegments = diarSegmentsForAttribution;
+      const rawDiarSegments = extractDiarSegments(diarResponse);
+      const asrSegments = rawDiarSegments;
+      const diarSegments = rawDiarSegments;
+      const diarSegmentsForAttribution = rawDiarSegments;
       const durationSec = audioBuffer.duration;
+      const debugAsrSegments: Array<AsrDebugSegment | null> = new Array(asrSegments.length).fill(
+        null
+      );
+      const asrSegmentWordBuckets: Array<WordToken[] | null> = new Array(asrSegments.length).fill(
+        null
+      );
+      let lastProgressUpdate = 0;
+
+      setTranscript(id, (prev) => ({
+        ...prev,
+        diarSegments
+      }));
+
+      const extractSegmentWords = (result: {
+        seg: (typeof asrSegments)[number];
+        clipStart: number;
+        clipEnd: number;
+        asr: any;
+      }) => {
+        if (!result.asr) return [];
+        const asrPayload = result.asr?.asr ?? result.asr;
+        const segmentWords = extractWords(asrPayload).map((w) => ({
+          ...w,
+          start: w.start + result.clipStart,
+          end: w.end + result.clipStart
+        }));
+
+        return segmentWords.filter((w) => {
+          const center = (w.start + w.end) / 2;
+          return center >= result.seg.start - 0.05 && center <= result.seg.end + 0.05;
+        });
+      };
+
+      const collectSegmentWords = () => {
+        const words: WordToken[] = [];
+        for (const bucket of asrSegmentWordBuckets) {
+          if (bucket && bucket.length) {
+            words.push(...bucket);
+          }
+        }
+        return words.sort((a, b) => (a.start - b.start) || (a.end - b.end));
+      };
+
+      const updatePartialTranscript = (force = false) => {
+        const now = Date.now();
+        if (!force && now - lastProgressUpdate < 250) return;
+        lastProgressUpdate = now;
+        const words = collectSegmentWords();
+        const mergedUtterances = buildUtterancesByDiarSegments(
+          words,
+          diarSegmentsForAttribution,
+          UI_UTTERANCE_MERGE_GAP_SEC
+        );
+        setTranscript(id, (prev) => ({
+          ...prev,
+          words,
+          diarSegments,
+          utterances: mergedUtterances
+        }));
+      };
 
       const asrSegmentResults = await mapWithConcurrency(
         asrSegments,
@@ -215,36 +337,40 @@ const App = () => {
           const mono = getMonoSlice(audioBuffer, clipStart, clipEnd);
           const wavBuffer = encodeWav(mono, audioBuffer.sampleRate);
           const blob = new Blob([wavBuffer], { type: "audio/wav" });
+          if (DEBUG_SAVE_ASR_SEGMENTS) {
+            const speakerTag = seg.speaker ? String(seg.speaker) : "unknown";
+            const fileLabel = safeName(
+              `${title || id}_seg_${index}_${speakerTag}_${clipStart.toFixed(2)}-${clipEnd.toFixed(2)}`
+            );
+            const url = URL.createObjectURL(blob);
+            debugAsrSegments[index] = {
+              id: fileLabel,
+              url,
+              filename: `${fileLabel}.wav`,
+              speaker: speakerTag,
+              start: clipStart,
+              end: clipEnd
+            };
+          }
           const speakerTag = "speaker" in seg ? `_${seg.speaker}` : "";
           const segFile = new File([blob], `seg_${index}${speakerTag}.wav`, { type: "audio/wav" });
           const asr = await transcribeAudio(segFile);
           return { seg, clipStart, clipEnd, asr };
+        },
+        (result, index) => {
+          if (!result.asr) return;
+          const filtered = extractSegmentWords(result);
+          asrSegmentWordBuckets[index] = filtered;
+          updatePartialTranscript();
         }
       );
 
-      const words: WordToken[] = [];
-
-      for (const result of asrSegmentResults) {
-        if (!result.asr) continue;
-        const asrPayload = result.asr?.asr ?? result.asr;
-        const segmentWords = extractWords(asrPayload).map((w) => ({
-          ...w,
-          start: w.start + result.clipStart,
-          end: w.end + result.clipStart
-        }));
-
-        const filtered = segmentWords.filter((w) => {
-          const center = (w.start + w.end) / 2;
-          return center >= result.seg.start - 0.05 && center <= result.seg.end + 0.05;
-        });
-
-        if (filtered.length) {
-          words.push(...filtered);
-        }
-      }
-
-      words.sort((a, b) => (a.start - b.start) || (a.end - b.end));
-      const mergedUtterances = buildUtterancesByDiarSegments(words, diarSegmentsForAttribution);
+      const words = collectSegmentWords();
+      const mergedUtterances = buildUtterancesByDiarSegments(
+        words,
+        diarSegmentsForAttribution,
+        UI_UTTERANCE_MERGE_GAP_SEC
+      );
       const speakers = Array.from(new Set(mergedUtterances.map((u) => u.speaker)));
 
       saveDebugArtifacts(
@@ -253,18 +379,33 @@ const App = () => {
         diarResponse
       );
 
+      const processingFinishedAt = Date.now();
+      const processingMs = processingFinishedAt - processingStartedAt;
+
       setTranscript(id, (prev) => ({
         ...prev,
         status: "ready",
+        processingFinishedAt,
+        processingMs,
         words,
         diarSegments,
         utterances: mergedUtterances,
-        speakerMap: Object.keys(prev.speakerMap).length ? prev.speakerMap : buildSpeakerMap(speakers)
+        speakerMap: Object.keys(prev.speakerMap).length ? prev.speakerMap : buildSpeakerMap(speakers),
+        debugAsrSegments: DEBUG_SAVE_ASR_SEGMENTS
+          ? debugAsrSegments.filter((seg): seg is AsrDebugSegment => Boolean(seg))
+          : prev.debugAsrSegments
       }));
 
       message.success("Transcription + diarization готово");
     } catch (err: any) {
-      setTranscript(id, (prev) => ({ ...prev, status: "error" }));
+      const processingFinishedAt = Date.now();
+      const processingMs = processingFinishedAt - processingStartedAt;
+      setTranscript(id, (prev) => ({
+        ...prev,
+        status: "error",
+        processingFinishedAt,
+        processingMs
+      }));
       message.error(err?.message || "Ошибка обработки аудио");
     }
   };
@@ -281,7 +422,7 @@ const App = () => {
       const updated = prev.utterances.map((u) =>
         u === utterance ? { ...u, speaker: newSpeaker } : u
       );
-      const merged = mergeUtterances(updated);
+      const merged = mergeUtterances(updated, UI_UTTERANCE_MERGE_GAP_SEC);
       const map = { ...prev.speakerMap };
       if (!map[newSpeaker]) {
         map[newSpeaker] = `Speaker ${Object.keys(map).length + 1}`;
@@ -663,6 +804,34 @@ const App = () => {
             )}
           </div>
 
+          <div className="sidebar-controls">
+            <div className="control-row">
+              <span className="control-label">Min speakers</span>
+              <InputNumber
+                min={1}
+                max={20}
+                value={minSpeakers ?? undefined}
+                placeholder="auto"
+                onChange={(value) =>
+                  setMinSpeakers(typeof value === "number" ? value : null)
+                }
+              />
+            </div>
+            <div className="control-row">
+              <span className="control-label">Max speakers</span>
+              <InputNumber
+                min={1}
+                max={20}
+                value={maxSpeakers ?? undefined}
+                placeholder="auto"
+                onChange={(value) =>
+                  setMaxSpeakers(typeof value === "number" ? value : null)
+                }
+              />
+            </div>
+            <span className="control-hint">Пусто = авто</span>
+          </div>
+
           <div className="sidebar-footer">
             <Upload
               accept="audio/*"
@@ -763,17 +932,6 @@ const App = () => {
                 })}
             </div>
             <div className="toolbar-actions">
-              <Select
-                size="small"
-                className="diar-select"
-                value={diarPreset}
-                onChange={(value) => setDiarPreset(value as keyof typeof DIAR_PRESETS)}
-                options={[
-                  { value: "sensitive", label: "Sensitive" },
-                  { value: "balanced", label: "Balanced" },
-                  { value: "strict", label: "Strict" }
-                ]}
-              />
               <Button
                 icon={<PlusOutlined />}
                 className="ghost-btn"
@@ -795,80 +953,124 @@ const App = () => {
               <div className="loading-state">
                 <Spin size="large" />
                 <Typography.Text>Обрабатываем аудио...</Typography.Text>
+                {processingElapsedMs != null && (
+                  <Typography.Text className="processing-time">
+                    Прошло: {formatDurationMs(processingElapsedMs)}
+                  </Typography.Text>
+                )}
               </div>
             )}
 
             {activeTranscript && activeTranscript.status === "error" && (
-              <Empty description="Ошибка обработки. Попробуйте другой файл." />
+              <>
+                <Empty description="Ошибка обработки. Попробуйте другой файл." />
+                {processingElapsedMs != null && (
+                  <Typography.Text className="processing-time">
+                    Время до ошибки: {formatDurationMs(processingElapsedMs)}
+                  </Typography.Text>
+                )}
+              </>
             )}
 
-            {activeTranscript && activeTranscript.status === "ready" && (
-              <div className="utterance-list">
-                {activeTranscript.utterances.map((utterance, index) => {
-                  const hue = hashHue(utterance.speaker);
-                  const isActive = activeUtteranceIndex === index;
-                  const isSpeaking = isActive && voiceLevel > 0.02;
-                  return (
-                    <div
-                      key={`${utterance.start}-${utterance.end}-${index}`}
-                      className={isActive ? "utterance active" : "utterance"}
-                      style={{ animationDelay: `${index * 30}ms` }}
-                      onClick={() => {
-                        if (audioRef.current) {
-                          audioRef.current.currentTime = utterance.start;
-                          audioRef.current.play();
-                        }
-                      }}
-                    >
-                      <div className="utterance-meta">
-                        <span
-                          className={isSpeaking ? "speaker-avatar speaking" : "speaker-avatar"}
-                          style={{
-                            background: `conic-gradient(from 180deg, hsl(${hue} 72% 64%), hsl(${(hue + 60) % 360} 78% 62%), hsl(${(hue + 120) % 360} 72% 58%))`
-                          }}
-                        />
-                        <div className="utterance-meta-text">
-                          <span className="speaker-title">
-                            {activeTranscript.speakerMap[utterance.speaker] || utterance.speaker}
-                          </span>
-                          <span className="timecode">
-                            {formatTime(utterance.start)} - {formatTime(utterance.end)}
-                          </span>
-                        </div>
-                        <Select
-                          size="small"
-                          value={utterance.speaker}
-                          className="speaker-select"
-                          onChange={(value) => handleUtteranceSpeakerChange(utterance, value)}
-                          options={Object.keys(activeTranscript.speakerMap).map((id) => ({
-                            value: id,
-                            label: activeTranscript.speakerMap[id] || id
-                          }))}
-                        />
-                      </div>
-                      <div className="utterance-text">
-                        {utterance.words.map((word, wIdx) => {
-                          const key = `${index}-${wIdx}`;
-                          return (
-                            <span
-                              key={key}
-                              className={
-                                key === activeWordKey ? "word active" : "word"
-                              }
-                              onClick={(event) => {
-                                event.stopPropagation();
-                                handleWordClick(word);
-                              }}
-                            >
-                              {word.word}
+            {activeTranscript && activeTranscript.status !== "error" && (
+              <>
+                {activeTranscript.status === "ready" && processingElapsedMs != null && (
+                  <Typography.Text className="processing-time">
+                    Готово за {formatDurationMs(processingElapsedMs)}
+                  </Typography.Text>
+                )}
+                {DEBUG_SAVE_ASR_SEGMENTS && activeTranscript.debugAsrSegments.length > 0 && (
+                  <details className="debug-asr">
+                    <summary>
+                      ASR segments sent ({activeTranscript.debugAsrSegments.length})
+                    </summary>
+                    <div className="debug-asr-list">
+                      {activeTranscript.debugAsrSegments.map((seg, index) => (
+                        <div className="debug-asr-item" key={`${seg.id}-${index}`}>
+                          <div className="debug-asr-meta">
+                            <span className="debug-asr-speaker">
+                              {activeTranscript.speakerMap[seg.speaker] || seg.speaker}
                             </span>
-                          );
-                        })}
-                      </div>
+                            <span className="debug-asr-time">
+                              {formatTime(seg.start)} - {formatTime(seg.end)}
+                            </span>
+                            <a className="debug-asr-download" href={seg.url} download={seg.filename}>
+                              Download
+                            </a>
+                          </div>
+                          <audio controls src={seg.url} preload="none" />
+                        </div>
+                      ))}
                     </div>
-                  );
-                })}
-              </div>
+                  </details>
+                )}
+                <div className="utterance-list">
+                  {activeTranscript.utterances.map((utterance, index) => {
+                    const hue = hashHue(utterance.speaker);
+                    const isActive = activeUtteranceIndex === index;
+                    const isSpeaking = isActive && voiceLevel > 0.02;
+                    return (
+                      <div
+                        key={`${utterance.start}-${utterance.end}-${index}`}
+                        className={isActive ? "utterance active" : "utterance"}
+                        style={{ animationDelay: `${index * 30}ms` }}
+                        onClick={() => {
+                          if (audioRef.current) {
+                            audioRef.current.currentTime = utterance.start;
+                            audioRef.current.play();
+                          }
+                        }}
+                      >
+                        <div className="utterance-meta">
+                          <span
+                            className={isSpeaking ? "speaker-avatar speaking" : "speaker-avatar"}
+                            style={{
+                              background: `conic-gradient(from 180deg, hsl(${hue} 72% 64%), hsl(${(hue + 60) % 360} 78% 62%), hsl(${(hue + 120) % 360} 72% 58%))`
+                            }}
+                          />
+                          <div className="utterance-meta-text">
+                            <span className="speaker-title">
+                              {activeTranscript.speakerMap[utterance.speaker] || utterance.speaker}
+                            </span>
+                            <span className="timecode">
+                              {formatTime(utterance.start)} - {formatTime(utterance.end)}
+                            </span>
+                          </div>
+                          <Select
+                            size="small"
+                            value={utterance.speaker}
+                            className="speaker-select"
+                            onChange={(value) => handleUtteranceSpeakerChange(utterance, value)}
+                            options={Object.keys(activeTranscript.speakerMap).map((id) => ({
+                              value: id,
+                              label: activeTranscript.speakerMap[id] || id
+                            }))}
+                          />
+                        </div>
+                        <div className="utterance-text">
+                          {utterance.words.map((word, wIdx) => {
+                            const key = `${index}-${wIdx}`;
+                            return (
+                              <span
+                                key={key}
+                                className={
+                                  key === activeWordKey ? "word active" : "word"
+                                }
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  handleWordClick(word);
+                                }}
+                              >
+                                {word.word}
+                              </span>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </>
             )}
           </div>
         </section>
