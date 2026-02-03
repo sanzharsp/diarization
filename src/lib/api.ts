@@ -1,6 +1,5 @@
 const API_BASE = import.meta.env.VITE_API_BASE ?? "https://mangisoz.nu.edu.kz/backend/api/v1";
-const DIARIZATION_URL =
-  import.meta.env.VITE_DIARIZATION_URL ?? "https://mangisoz.nu.edu.kz/diarization_v2/v1/analyze";
+const DIARIZATION_URL = import.meta.env.VITE_DIARIZATION_URL ?? "";
 const DIARIZATION_BASE = import.meta.env.VITE_DIARIZATION_BASE ?? "";
 const DIARIZATION_PATH = import.meta.env.VITE_DIARIZATION_PATH ?? "";
 const DIARIZATION_AUTH_TOKEN = import.meta.env.VITE_DIARIZATION_AUTH_TOKEN ?? "";
